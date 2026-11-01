@@ -1,0 +1,100 @@
+name: Dev Release by Tag
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: '빌드할 upstream 태그 이름을 입력하세요 (예: v1.1.7)'
+        required: true
+        default: 'v1.1.7'
+
+permissions:
+  contents: write # Release 생성 및 태그 관리를 위한 권한 설정
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+    # 1. 포크 저장소 Checkout
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    # 2. upstream 원격 저장소 추가 및 입력받은 태그 체크아웃
+    - name: Fetch Upstream and Checkout Tag
+      shell: pwsh
+      run: |
+        $upstreamUrl = "${{ github.event.repository.parent.clone_url }}"
+        $targetTag = "${{ inputs.tag_name }}"
+
+        if (-not $upstreamUrl) {$upstreamUrl = "https://github.com/SpectrumQT/XXMI-Libs-Package.git"
+        }
+
+        Write-Host "Upstream URL: $upstreamUrl"
+        git remote add upstream $upstreamUrl 2>$null
+        
+        git fetch upstream --tags --unshallow 2>$null
+        git fetch upstream --tags
+
+        Write-Host "Checking out tag into a temporary branch: $targetTag"
+        git checkout -b "build-target" "refs/tags/$targetTag"
+
+        # 버전 생성 스크립트가 인식할 수 있도록 확인
+        git describe --tags
+
+    # 3. MSBuild 환경 구성
+    - name: Add MSBuild for VS2022 to PATH
+      uses: microsoft/setup-msbuild@v2
+      with:
+        vs-version: '[17.0,18.0)'
+
+    # 4. 솔루션 빌드
+    - name: Build solution
+      run: >
+        msbuild StereoVisionHacks.sln
+        -property:Configuration="Zip Release"
+        -property:Platform=x64
+        -target:rebuild
+        -verbosity:minimal
+
+    # 5. 빌드 결과물 ZIP 압축
+    - name: Zip DLLs
+      shell: pwsh
+      run: |
+        $dll_files = Get-ChildItem -Path './x64/Zip Release' -Filter '*.dll'
+        Compress-Archive -Path $dll_files.FullName -DestinationPath './LibrariesTemp.zip'
+
+    # 6. 동일한 태그의 기존 Release 및 Remote Tag가 존재하면 삭제
+    - name: Delete Existing Release and Tag
+      shell: pwsh
+      run: |
+        $targetTag = "${{ inputs.tag_name }}"
+        $env:GH_TOKEN = "${{ secrets.GITHUB_TOKEN }}"
+
+        Write-Host "Checking for existing release: $targetTag"
+        
+        # 기존 릴리스가 존재하는지 확인
+        $releaseExists = gh release view $targetTag 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "Existing release found. Deleting..."
+            gh release delete $targetTag --yes --cleanup-tag
+        } else {
+            Write-Host "No existing release found for $targetTag. Skipping delete."
+        }
+
+        # 성공 처리 강제 (exit code 초기화)
+        $global:LASTEXITCODE = 0
+
+    # 7. 입력받은 태그 이름으로 Release 새로 생성 및 ZIP 업로드
+    - name: Create GitHub Release and Upload Asset
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ inputs.tag_name }}
+        name: "Release ${{ inputs.tag_name }}"
+        body: "Upstream 태그 `${{ inputs.tag_name }}` 기반 자동 재빌드 릴리스입니다."
+        prerelease: false
+        files: './LibrariesTemp.zip'
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
